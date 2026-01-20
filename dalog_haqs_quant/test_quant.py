@@ -1,0 +1,336 @@
+﻿import os
+import sys
+import torch
+from torch import nn
+import numpy as np
+from functools import partial
+import argparse
+import importlib
+import timm
+import copy
+import time
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+import utils.datasets as mydatasets
+from utils.calibrator import QuantCalibrator
+from utils.block_recon import BlockReconstructor
+from utils.wrap_net import wrap_modules_in_net, wrap_reparamed_modules_in_net
+from utils.test_utils import *
+from datetime import datetime
+import logging
+while True:
+    try:
+        timestamp = datetime.now()
+        formatted_timestamp = timestamp.strftime("%Y%m%d_%H%M")
+        root_path = './checkpoints/quant_result/{}'.format(formatted_timestamp)
+        os.makedirs(root_path)
+        break
+    except FileExistsError:
+        time.sleep(10)
+logging.basicConfig(level=logging.INFO,
+                    format='%(message)s',
+                    handlers=[
+                        logging.FileHandler('{}/output.log'.format(root_path)),
+                        logging.StreamHandler()
+                    ])
+import builtins
+original_print = builtins.print
+def custom_print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    original_print(*args, **kwargs)
+builtins.print = custom_print
+def get_args_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--model", default="deit_small",
+                        choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large',
+                                 'deit_tiny', 'deit_small', 'deit_base', 
+                                 'swin_tiny', 'swin_small', 'swin_base', 'swin_base_384'],
+                        help="model")
+    parser.add_argument('--config', type=str, default="./configs/vit_config.py",
+                        help="File path to import Config class from")
+    parser.add_argument('--dataset', default="/dataset/imagenet/",
+                        help='path to dataset')
+    parser.add_argument("--calib-size", default=argparse.SUPPRESS,
+                        type=int, help="size of calibration set")
+    parser.add_argument("--optim-size", default=1024,
+                        type=int, help="size of calibration set")
+    parser.add_argument("--calib-batch-size", default=argparse.SUPPRESS,
+                        type=int, help="batchsize of calibration set")
+    parser.add_argument("--optim-batch-size", default=argparse.SUPPRESS,
+                        type=int, help="batchsize of calibration set")
+    parser.add_argument("--val-batch-size", default=200,
+                        type=int, help="batchsize of validation set")
+    parser.add_argument("--num-workers", default=8, type=int,
+                        help="number of data loading workers (default: 8)")
+    parser.add_argument("--device", default="cuda", type=str, help="device")
+    parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--world-size', default=1, type=int, help='number of distributed processes')
+    parser.add_argument('--rank', default=0, type=int, help='rank of this process')
+    parser.add_argument('--gpu', default=None, type=int, help="GPU id to use.")
+    calibrate_mode_group = parser.add_mutually_exclusive_group()
+    calibrate_mode_group.add_argument('--calibrate', action='store_true', help="Calibrate the model")
+    calibrate_mode_group.add_argument('--load-calibrate-checkpoint', type=str, default=None, help="Path to the calibrated checkpoint.")
+    parser.add_argument('--test-calibrate-checkpoint', action='store_true', help='validate the calibrated checkpoint.')
+    optimize_mode_group = parser.add_mutually_exclusive_group()
+    optimize_mode_group.add_argument('--optimize', action='store_true', help="Optimize the model")
+    optimize_mode_group.add_argument('--load-optimize-checkpoint', type=str, default=None, help="Path to the optimized checkpoint.")
+    parser.add_argument('--test-optimize-checkpoint', action='store_true', help='validate the optimized checkpoint.')
+    parser.add_argument("--print-freq", default=10,
+                        type=int, help="print frequency")
+    parser.add_argument("--seed", default=3407, type=int, help="seed")
+    parser.add_argument('--w_bit', type=int, default=argparse.SUPPRESS, help='bit-precision of weights')
+    parser.add_argument('--a_bit', type=int, default=argparse.SUPPRESS, help='bit-precision of activation')
+    parser.add_argument("--calib-metric", type=str, default=argparse.SUPPRESS, choices=['mse', 'mae'], 
+                        help='calibration metric')
+    parser.add_argument("--optim-metric", type=str, default=argparse.SUPPRESS, choices=['fisher_brecq', 'fisher_lr', 'fisher_diag', 'fisher_dplr', 'mse', 'mae'], 
+                        help='optimization metric')
+    parser.add_argument('--optim-mode', type=str, default=argparse.SUPPRESS, choices=['qinp', 'rinp', 'qdrop'], 
+                        help='`qinp`:use quanted input; `rinp`: use raw input; `qdrop` use qdrop input;')
+    parser.add_argument('--drop-prob', type=float, default=argparse.SUPPRESS, 
+                        help='dropping rate in qdrop. set `drop-prob = 1.0` if do not use qdrop.')
+    parser.add_argument('--k', type=int, default=argparse.SUPPRESS, help='The rank of Fisher')
+    parser.add_argument('--p1', type=float, default=argparse.SUPPRESS, help='The proportion of low rank')
+    parser.add_argument('--p2', type=float, default=argparse.SUPPRESS, help='The proportion of diag')
+    parser.add_argument('--dis-mode', type=str, default=argparse.SUPPRESS, choices=['q','qf'],
+                        help='the mode of getting gradient. `q`: use quantization; `qf` Take the first k times (default:Uniformly obtain k times);')
+    return parser
+def seed_all(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+def get_cur_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def save_model(model, args, cfg, mode='calibrate'):
+    if args.rank != 0:
+        return
+    assert mode in ['calibrate', 'optimize']
+    if mode == 'calibrate':
+        auto_name = '{}_w{}_a{}_calibsize_{}_{}.pth'.format(
+            args.model, cfg.w_bit, cfg.a_bit, cfg.calib_size, cfg.calib_metric)
+    else:
+        auto_name = '{}_w{}_a{}_optimsize_{}_{}{}{}_{}.pth'.format(
+            args.model, cfg.w_bit, cfg.a_bit, cfg.optim_size, cfg.optim_metric, 
+            '' if cfg.optim_metric in ['mse', 'mae'] else '_dis_mode_' + cfg.dis_mode, 
+            '' if cfg.optim_metric not in['fisher_lr', 'fisher_dplr'] else '_rank_' + str(cfg.k), 
+            cfg.optim_mode)
+    save_path = os.path.join(root_path, auto_name)
+    logging.info(f"Saving checkpoint to {save_path}")
+    torch.save(model.state_dict(), save_path)
+def load_model(model, args, device, mode='calibrate'):
+    assert mode in ['calibrate', 'optimize']
+    ckpt_path = args.load_calibrate_checkpoint if mode == 'calibrate' else args.load_optimize_checkpoint
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model_without_ddp = model.module if hasattr(model, 'module') else model
+    for name, module in model_without_ddp.named_modules():
+        if hasattr(module, 'mode'):
+            module.calibrated = True
+            module.mode = 'quant_forward'
+        if isinstance(module, nn.Linear) and 'reduction' in name:
+            module.bias = nn.Parameter(torch.zeros(module.out_features))
+        quantizer_attrs = ['a_quantizer', 'w_quantizer', 'A_quantizer', 'B_quantizer']
+        for attr in quantizer_attrs:
+            if hasattr(module, attr):
+                getattr(module, attr).inited = True
+                ckpt_name = name + '.' + attr + '.scale'
+                if ckpt_name in ckpt:
+                    getattr(module, attr).scale.data = ckpt[ckpt_name].clone()
+    result = model_without_ddp.load_state_dict(ckpt, strict=False)
+    logging.info(str(result))
+    model_without_ddp.to(device)
+    model_without_ddp.eval()
+    return model
+def main(args):
+    init_distributed_mode(args)
+    if args.rank == 0:
+        logging.info("{} - start the process.".format(get_cur_time()))
+        logging.info(str(args))
+    dir_path = os.path.dirname(os.path.abspath(args.config))
+    if dir_path not in sys.path:
+        sys.path.append(dir_path)
+    module_name = os.path.splitext(os.path.basename(args.config))[0]
+    imported_module = importlib.import_module(module_name)
+    Config = getattr(imported_module, 'Config')
+    logging.info("Successfully imported Config class!")
+    cfg = Config()
+    cfg.calib_size = args.calib_size if hasattr(args, 'calib_size') else cfg.calib_size
+    cfg.optim_size = args.optim_size if hasattr(args, 'optim_size') else cfg.optim_size
+    cfg.calib_batch_size = args.calib_batch_size if hasattr(args, 'calib_batch_size') else cfg.calib_batch_size
+    cfg.optim_batch_size = args.optim_batch_size if hasattr(args, 'optim_batch_size') else cfg.optim_batch_size
+    cfg.calib_metric = args.calib_metric if hasattr(args, 'calib_metric') else cfg.calib_metric
+    cfg.optim_metric = args.optim_metric if hasattr(args, 'optim_metric') else cfg.optim_metric
+    cfg.optim_mode = args.optim_mode if hasattr(args, 'optim_mode') else cfg.optim_mode
+    cfg.drop_prob = args.drop_prob if hasattr(args, 'drop_prob') else cfg.drop_prob
+    cfg.w_bit = args.w_bit if hasattr(args, 'w_bit') else cfg.w_bit
+    cfg.a_bit = args.a_bit if hasattr(args, 'a_bit') else cfg.a_bit
+    cfg.k = args.k if hasattr(args, 'k') else cfg.k
+    cfg.p1 = args.p1 if hasattr(args, 'p1') else cfg.p1
+    cfg.p2 = args.p2 if hasattr(args, 'p2') else cfg.p2
+    cfg.dis_mode = args.dis_mode if hasattr(args, 'dis_mode') else cfg.dis_mode
+    for name, value in vars(cfg).items():
+        logging.info(f"{name}: {value}")
+    if args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        device = torch.device(args.gpu)
+    else:
+        device = torch.device(args.device)
+    model_zoo = {
+        'vit_tiny'  : 'vit_tiny_patch16_224',
+        'vit_small' : 'vit_small_patch16_224',
+        'vit_base'  : 'vit_base_patch16_224',
+        'vit_large' : 'vit_large_patch16_224',
+        'deit_tiny' : 'deit_tiny_patch16_224',
+        'deit_small': 'deit_small_patch16_224',
+        'deit_base' : 'deit_base_patch16_224',
+        'swin_tiny' : 'swin_tiny_patch4_window7_224',
+        'swin_small': 'swin_small_patch4_window7_224',
+        'swin_base' : 'swin_base_patch4_window7_224',
+        'swin_base_384': 'swin_base_patch4_window12_384',
+    }
+    seed_all(args.seed)
+    logging.info('Building model ...')
+    try:
+        model = timm.create_model(model_zoo[args.model], checkpoint_path='./checkpoints/vit_raw/{}.bin'.format(model_zoo[args.model]))
+    except:
+        model = timm.create_model(model_zoo[args.model], pretrained=True)
+    model.to(device)
+    model.eval()
+    data_path = args.dataset
+    g = mydatasets.ViTImageNetLoaderGenerator(data_path, args.val_batch_size, args.num_workers, kwargs={"model":model})
+    logging.info('Building validation dataloader ...')
+    original_val_loader = g.val_loader()
+    if args.distributed:
+        val_sampler = DistributedSampler(original_val_loader.dataset, shuffle=False)
+        per_gpu_batch_size = original_val_loader.batch_size // args.world_size
+        val_loader = torch.utils.data.DataLoader(
+            original_val_loader.dataset,
+            batch_size=per_gpu_batch_size,
+            sampler=val_sampler,
+            num_workers=original_val_loader.num_workers,
+            pin_memory=True
+        )
+    else:
+        val_sampler = None
+        val_loader = original_val_loader
+    criterion = nn.CrossEntropyLoss().to(device)
+    reparam = args.load_calibrate_checkpoint is None and args.load_optimize_checkpoint is None
+    logging.info('Wraping quantiztion modules (reparam: {}) ...'.format(reparam))
+    model = wrap_modules_in_net(model, cfg, reparam=reparam)
+    model.to(device)
+    model.eval()
+    if not args.load_optimize_checkpoint:
+        if args.load_calibrate_checkpoint:
+            logging.info(f"Restoring checkpoint from '{args.load_calibrate_checkpoint}'")
+            model = load_model(model, args, device, mode='calibrate')
+            if args.distributed:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            if args.test_calibrate_checkpoint:
+                val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+        else:
+            if args.rank == 0:
+                logging.info("{} - start {} guided calibration".format(get_cur_time(), cfg.calib_metric))
+            original_calib_loader = g.calib_loader(num=cfg.calib_size, batch_size=cfg.calib_batch_size, seed=args.seed)
+            if args.distributed:
+                calib_sampler = DistributedSampler(original_calib_loader.dataset)
+                per_gpu_batch_size = original_calib_loader.batch_size // args.world_size
+                calib_loader = torch.utils.data.DataLoader(
+                    original_calib_loader.dataset,
+                    batch_size=per_gpu_batch_size,
+                    sampler=calib_sampler,
+                    num_workers=original_calib_loader.num_workers,
+                    pin_memory=True
+                )
+            else:
+                calib_sampler = None
+                calib_loader = original_calib_loader
+            quant_calibrator = QuantCalibrator(model, calib_loader)
+            quant_calibrator.batching_quant_calib()        
+            model = wrap_reparamed_modules_in_net(model)
+            model.to(device)
+            if args.distributed:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            if args.rank == 0:
+                logging.info("{} - {} guided calibration finished.".format(get_cur_time(), cfg.calib_metric))
+                save_model(model.module if args.distributed else model, args, cfg, mode='calibrate')
+                logging.info('Validating after calibration ...')
+            val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+    if args.optimize:
+        if args.rank == 0:
+            logging.info('Building calibrator ...')
+        original_optim_loader = g.calib_loader(num=cfg.optim_size, batch_size=cfg.optim_batch_size, seed=args.seed)
+        if args.distributed:
+            optim_sampler = DistributedSampler(original_optim_loader.dataset)
+            per_gpu_batch_size = original_optim_loader.batch_size // args.world_size
+            calib_loader = torch.utils.data.DataLoader(
+                original_optim_loader.dataset,
+                batch_size=per_gpu_batch_size,
+                sampler=optim_sampler,
+                num_workers=original_optim_loader.num_workers,
+                pin_memory=True
+            )
+        else:
+            optim_sampler = None
+            calib_loader = original_optim_loader
+        if args.rank == 0:
+            logging.info("{} - start {} guided block reconstruction".format(get_cur_time(), cfg.optim_metric))
+            model_for_reconstruction = model.module if hasattr(model, 'module') else model
+            block_reconstructor = BlockReconstructor(model_for_reconstruction, cfg.optim_batch_size, calib_loader, metric=cfg.optim_metric, temp=cfg.temp, k=cfg.k, dis_mode=cfg.dis_mode, p1=cfg.p1, p2=cfg.p2)
+            block_reconstructor.reconstruct_model(quant_act=True, mode=cfg.optim_mode, drop_prob=cfg.drop_prob, keep_gpu=cfg.keep_gpu)
+            logging.info("{} - {} guided block reconstruction finished.".format(get_cur_time(), cfg.optim_metric))
+            save_model(model_for_reconstruction, args, cfg, mode='optimize')
+        if args.distributed:
+            dist.barrier()
+            model_without_ddp = model.module if hasattr(model, 'module') else model
+            model = torch.nn.parallel.DistributedDataParallel(model_without_ddp, device_ids=[args.gpu])
+    if args.load_optimize_checkpoint:
+        if args.rank == 0:
+            logging.info('Building calibrator ...')
+        original_optim_loader_2 = g.calib_loader(num=cfg.optim_size, batch_size=cfg.optim_batch_size, seed=args.seed)
+        if args.distributed:
+            optim_sampler_2 = DistributedSampler(original_optim_loader_2.dataset)
+            per_gpu_batch_size = original_optim_loader_2.batch_size // args.world_size
+            calib_loader = torch.utils.data.DataLoader(
+                original_optim_loader_2.dataset,
+                batch_size=per_gpu_batch_size,
+                sampler=optim_sampler_2,
+                num_workers=original_optim_loader_2.num_workers,
+                pin_memory=True
+            )
+        else:
+            optim_sampler = None
+            calib_loader = original_optim_loader_2
+        model = load_model(model, args, device, mode='optimize')
+    if args.optimize or args.test_optimize_checkpoint:
+        if args.rank == 0:
+            logging.info('Validating on calibration set after block reconstruction ...')
+        val_loss, val_prec1, val_prec5 = validate(calib_loader, model, criterion, print_freq=args.print_freq, device=device)
+        if args.rank == 0:
+            logging.info('Validating on test set after block reconstruction ...')
+        val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+    if args.rank == 0:
+        logging.info("{} - finished the process.".format(get_cur_time()))
+def init_distributed_mode(args):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+    args.distributed = True
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    dist.barrier()
+    print("All processes have been synchronized.")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(parents=[get_args_parser()])
+    args = parser.parse_args()
+    main(args)
